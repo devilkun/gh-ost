@@ -1,5 +1,5 @@
 /*
-   Copyright 2016 GitHub Inc.
+   Copyright 2022 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -36,6 +36,7 @@ const (
 type EventsStreamer struct {
 	connectionConfig         *mysql.ConnectionConfig
 	db                       *gosql.DB
+	dbVersion                string
 	migrationContext         *base.MigrationContext
 	initialBinlogCoordinates *mysql.BinlogCoordinates
 	listeners                [](*BinlogEventListener)
@@ -59,7 +60,6 @@ func NewEventsStreamer(migrationContext *base.MigrationContext) *EventsStreamer 
 // AddListener registers a new listener for binlog events, on a per-table basis
 func (this *EventsStreamer) AddListener(
 	async bool, databaseName string, tableName string, onDmlEvent func(event *binlog.BinlogDMLEvent) error) (err error) {
-
 	this.listenersMutex.Lock()
 	defer this.listenersMutex.Unlock()
 
@@ -87,10 +87,10 @@ func (this *EventsStreamer) notifyListeners(binlogEvent *binlog.BinlogDMLEvent) 
 
 	for _, listener := range this.listeners {
 		listener := listener
-		if strings.ToLower(listener.databaseName) != strings.ToLower(binlogEvent.DatabaseName) {
+		if !strings.EqualFold(listener.databaseName, binlogEvent.DatabaseName) {
 			continue
 		}
-		if strings.ToLower(listener.tableName) != strings.ToLower(binlogEvent.TableName) {
+		if !strings.EqualFold(listener.tableName, binlogEvent.TableName) {
 			continue
 		}
 		if listener.async {
@@ -108,9 +108,11 @@ func (this *EventsStreamer) InitDBConnections() (err error) {
 	if this.db, _, err = mysql.GetDB(this.migrationContext.Uuid, EventsStreamerUri); err != nil {
 		return err
 	}
-	if _, err := base.ValidateConnection(this.db, this.connectionConfig, this.migrationContext, this.name); err != nil {
+	version, err := base.ValidateConnection(this.db, this.connectionConfig, this.migrationContext, this.name)
+	if err != nil {
 		return err
 	}
+	this.dbVersion = version
 	if err := this.readCurrentBinlogCoordinates(); err != nil {
 		return err
 	}
@@ -123,10 +125,7 @@ func (this *EventsStreamer) InitDBConnections() (err error) {
 
 // initBinlogReader creates and connects the reader: we hook up to a MySQL server as a replica
 func (this *EventsStreamer) initBinlogReader(binlogCoordinates *mysql.BinlogCoordinates) error {
-	goMySQLReader, err := binlog.NewGoMySQLReader(this.migrationContext)
-	if err != nil {
-		return err
-	}
+	goMySQLReader := binlog.NewGoMySQLReader(this.migrationContext)
 	if err := goMySQLReader.ConnectBinlogStreamer(*binlogCoordinates); err != nil {
 		return err
 	}
@@ -144,7 +143,8 @@ func (this *EventsStreamer) GetReconnectBinlogCoordinates() *mysql.BinlogCoordin
 
 // readCurrentBinlogCoordinates reads master status from hooked server
 func (this *EventsStreamer) readCurrentBinlogCoordinates() error {
-	query := `show /* gh-ost readCurrentBinlogCoordinates */ master status`
+	binaryLogStatusTerm := mysql.ReplicaTermFor(this.dbVersion, "master status")
+	query := fmt.Sprintf("show /* gh-ost readCurrentBinlogCoordinates */ %s", binaryLogStatusTerm)
 	foundMasterStatus := false
 	err := sqlutils.QueryRowsMap(this.db, query, func(m sqlutils.RowMap) error {
 		this.initialBinlogCoordinates = &mysql.BinlogCoordinates{
@@ -159,7 +159,7 @@ func (this *EventsStreamer) readCurrentBinlogCoordinates() error {
 		return err
 	}
 	if !foundMasterStatus {
-		return fmt.Errorf("Got no results from SHOW MASTER STATUS. Bailing out")
+		return fmt.Errorf("Got no results from SHOW %s. Bailing out", strings.ToUpper(binaryLogStatusTerm))
 	}
 	this.migrationContext.Log.Debugf("Streamer binlog coordinates: %+v", *this.initialBinlogCoordinates)
 	return nil
@@ -197,7 +197,7 @@ func (this *EventsStreamer) StreamEvents(canStopStreaming func() bool) error {
 			} else {
 				successiveFailures = 0
 			}
-			if successiveFailures > this.migrationContext.MaxRetries() {
+			if successiveFailures >= this.migrationContext.MaxRetries() {
 				return fmt.Errorf("%d successive failures in streamer reconnect at coordinates %+v", successiveFailures, this.GetReconnectBinlogCoordinates())
 			}
 
@@ -220,5 +220,4 @@ func (this *EventsStreamer) Close() (err error) {
 
 func (this *EventsStreamer) Teardown() {
 	this.db.Close()
-	return
 }

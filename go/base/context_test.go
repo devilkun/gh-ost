@@ -1,19 +1,17 @@
 /*
-   Copyright 2021 GitHub Inc.
+   Copyright 2022 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
 package base
 
 import (
-	"fmt"
-	"io/ioutil"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/openark/golib/log"
-	test "github.com/openark/golib/tests"
+	"github.com/stretchr/testify/require"
 )
 
 func init() {
@@ -24,22 +22,22 @@ func TestGetTableNames(t *testing.T) {
 	{
 		context := NewMigrationContext()
 		context.OriginalTableName = "some_table"
-		test.S(t).ExpectEquals(context.GetOldTableName(), "_some_table_del")
-		test.S(t).ExpectEquals(context.GetGhostTableName(), "_some_table_gho")
-		test.S(t).ExpectEquals(context.GetChangelogTableName(), "_some_table_ghc")
+		require.Equal(t, "_some_table_del", context.GetOldTableName())
+		require.Equal(t, "_some_table_gho", context.GetGhostTableName())
+		require.Equal(t, "_some_table_ghc", context.GetChangelogTableName(), "_some_table_ghc")
 	}
 	{
 		context := NewMigrationContext()
 		context.OriginalTableName = "a123456789012345678901234567890123456789012345678901234567890"
-		test.S(t).ExpectEquals(context.GetOldTableName(), "_a1234567890123456789012345678901234567890123456789012345678_del")
-		test.S(t).ExpectEquals(context.GetGhostTableName(), "_a1234567890123456789012345678901234567890123456789012345678_gho")
-		test.S(t).ExpectEquals(context.GetChangelogTableName(), "_a1234567890123456789012345678901234567890123456789012345678_ghc")
+		require.Equal(t, "_a1234567890123456789012345678901234567890123456789012345678_del", context.GetOldTableName())
+		require.Equal(t, "_a1234567890123456789012345678901234567890123456789012345678_gho", context.GetGhostTableName())
+		require.Equal(t, "_a1234567890123456789012345678901234567890123456789012345678_ghc", context.GetChangelogTableName())
 	}
 	{
 		context := NewMigrationContext()
 		context.OriginalTableName = "a123456789012345678901234567890123456789012345678901234567890123"
 		oldTableName := context.GetOldTableName()
-		test.S(t).ExpectEquals(oldTableName, "_a1234567890123456789012345678901234567890123456789012345678_del")
+		require.Equal(t, "_a1234567890123456789012345678901234567890123456789012345678_del", oldTableName)
 	}
 	{
 		context := NewMigrationContext()
@@ -48,15 +46,15 @@ func TestGetTableNames(t *testing.T) {
 		longForm := "Jan 2, 2006 at 3:04pm (MST)"
 		context.StartTime, _ = time.Parse(longForm, "Feb 3, 2013 at 7:54pm (PST)")
 		oldTableName := context.GetOldTableName()
-		test.S(t).ExpectEquals(oldTableName, "_a1234567890123456789012345678901234567890123_20130203195400_del")
+		require.Equal(t, "_a1234567890123456789012345678901234567890123_20130203195400_del", oldTableName)
 	}
 	{
 		context := NewMigrationContext()
 		context.OriginalTableName = "foo_bar_baz"
 		context.ForceTmpTableName = "tmp"
-		test.S(t).ExpectEquals(context.GetOldTableName(), "_tmp_del")
-		test.S(t).ExpectEquals(context.GetGhostTableName(), "_tmp_gho")
-		test.S(t).ExpectEquals(context.GetChangelogTableName(), "_tmp_ghc")
+		require.Equal(t, "_tmp_del", context.GetOldTableName())
+		require.Equal(t, "_tmp_gho", context.GetGhostTableName())
+		require.Equal(t, "_tmp_ghc", context.GetChangelogTableName())
 	}
 }
 
@@ -69,7 +67,7 @@ func TestReadConfigFile(t *testing.T) {
 		}
 	}
 	{
-		f, err := ioutil.TempFile("", t.Name())
+		f, err := os.CreateTemp("", t.Name())
 		if err != nil {
 			t.Fatalf("Failed to create tmp file: %v", err)
 		}
@@ -83,13 +81,13 @@ func TestReadConfigFile(t *testing.T) {
 		}
 	}
 	{
-		f, err := ioutil.TempFile("", t.Name())
+		f, err := os.CreateTemp("", t.Name())
 		if err != nil {
 			t.Fatalf("Failed to create tmp file: %v", err)
 		}
 		defer os.Remove(f.Name())
 
-		f.Write([]byte(fmt.Sprintf("[client]\nuser=test\npassword=123456")))
+		f.Write([]byte("[client]\nuser=test\npassword=123456"))
 		context := NewMigrationContext()
 		context.ConfigFile = f.Name()
 		if err := context.ReadConfigFile(); err != nil {
@@ -103,13 +101,13 @@ func TestReadConfigFile(t *testing.T) {
 		}
 	}
 	{
-		f, err := ioutil.TempFile("", t.Name())
+		f, err := os.CreateTemp("", t.Name())
 		if err != nil {
 			t.Fatalf("Failed to create tmp file: %v", err)
 		}
 		defer os.Remove(f.Name())
 
-		f.Write([]byte(fmt.Sprintf("[osc]\nmax_load=10")))
+		f.Write([]byte("[osc]\nmax_load=10"))
 		context := NewMigrationContext()
 		context.ConfigFile = f.Name()
 		if err := context.ReadConfigFile(); err != nil {

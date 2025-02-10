@@ -1,5 +1,5 @@
 /*
-   Copyright 2016 GitHub Inc.
+   Copyright 2022 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/satori/go.uuid"
+	uuid "github.com/google/uuid"
 
 	"github.com/github/gh-ost/go/mysql"
 	"github.com/github/gh-ost/go/sql"
@@ -82,6 +82,8 @@ type MigrationContext struct {
 	AlterStatement        string
 	AlterStatementOptions string // anything following the 'ALTER TABLE [schema.]table' from AlterStatement
 
+	countMutex               sync.Mutex
+	countTableRowsCancelFunc func()
 	CountTableRows           bool
 	ConcurrentCountTableRows bool
 	AllowedRunningOnMaster   bool
@@ -90,6 +92,7 @@ type MigrationContext struct {
 	AssumeRBR                bool
 	SkipForeignKeyChecks     bool
 	SkipStrictMode           bool
+	AllowZeroInDate          bool
 	NullableUniqueKeyAllowed bool
 	ApproveRenamedColumns    bool
 	SkipRenamedColumns       bool
@@ -98,6 +101,12 @@ type MigrationContext struct {
 	AliyunRDS                bool
 	GoogleCloudPlatform      bool
 	AzureMySQL               bool
+	AttemptInstantDDL        bool
+
+	// SkipPortValidation allows skipping the port validation in `ValidateConnection`
+	// This is useful when connecting to a MySQL instance where the external port
+	// may not match the internal port.
+	SkipPortValidation bool
 
 	config            ContextConfig
 	configMutex       *sync.Mutex
@@ -160,6 +169,7 @@ type MigrationContext struct {
 	Hostname                               string
 	AssumeMasterHostname                   string
 	ApplierTimeZone                        string
+	ApplierWaitTimeout                     int64
 	TableEngine                            string
 	RowsEstimate                           int64
 	RowsDeltaEstimate                      int64
@@ -184,7 +194,10 @@ type MigrationContext struct {
 	CurrentLag                             int64
 	currentProgress                        uint64
 	etaNanoseonds                          int64
+	EtaRowsPerSecond                       int64
+	ThrottleHTTPIntervalMillis             int64
 	ThrottleHTTPStatusCode                 int64
+	ThrottleHTTPTimeoutMillis              int64
 	controlReplicasLagResult               mysql.ReplicationLagResult
 	TotalRowsCopied                        int64
 	TotalDMLEventsApplied                  int64
@@ -226,6 +239,8 @@ type MigrationContext struct {
 
 	recentBinlogCoordinates mysql.BinlogCoordinates
 
+	BinlogSyncerMaxReconnectAttempts int
+
 	Log Logger
 }
 
@@ -261,7 +276,7 @@ type ContextConfig struct {
 
 func NewMigrationContext() *MigrationContext {
 	return &MigrationContext{
-		Uuid:                                uuid.NewV4().String(),
+		Uuid:                                uuid.NewString(),
 		defaultNumRetries:                   60,
 		ChunkSize:                           1000,
 		InspectorConnectionConfig:           mysql.NewConnectionConfig(),
@@ -282,6 +297,28 @@ func NewMigrationContext() *MigrationContext {
 		PanicAbort:                          make(chan error),
 		Log:                                 NewDefaultLogger(),
 	}
+}
+
+func (this *MigrationContext) SetConnectionConfig(storageEngine string) error {
+	var transactionIsolation string
+	switch storageEngine {
+	case "rocksdb":
+		transactionIsolation = "READ-COMMITTED"
+	default:
+		transactionIsolation = "REPEATABLE-READ"
+	}
+	this.InspectorConnectionConfig.TransactionIsolation = transactionIsolation
+	this.ApplierConnectionConfig.TransactionIsolation = transactionIsolation
+	return nil
+}
+
+func (this *MigrationContext) SetConnectionCharset(charset string) {
+	if charset == "" {
+		charset = "utf8mb4,utf8,latin1"
+	}
+
+	this.InspectorConnectionConfig.Charset = charset
+	this.ApplierConnectionConfig.Charset = charset
 }
 
 func getSafeTableName(baseName string, suffix string) string {
@@ -422,8 +459,42 @@ func (this *MigrationContext) IsTransactionalTable() bool {
 		{
 			return true
 		}
+	case "rocksdb":
+		{
+			return true
+		}
 	}
 	return false
+}
+
+// SetCountTableRowsCancelFunc sets the cancel function for the CountTableRows query context
+func (this *MigrationContext) SetCountTableRowsCancelFunc(f func()) {
+	this.countMutex.Lock()
+	defer this.countMutex.Unlock()
+
+	this.countTableRowsCancelFunc = f
+}
+
+// IsCountingTableRows returns true if the migration has a table count query running
+func (this *MigrationContext) IsCountingTableRows() bool {
+	this.countMutex.Lock()
+	defer this.countMutex.Unlock()
+
+	return this.countTableRowsCancelFunc != nil
+}
+
+// CancelTableRowsCount cancels the CountTableRows query context. It is safe to
+// call function even when IsCountingTableRows is false.
+func (this *MigrationContext) CancelTableRowsCount() {
+	this.countMutex.Lock()
+	defer this.countMutex.Unlock()
+
+	if this.countTableRowsCancelFunc == nil {
+		return
+	}
+
+	this.countTableRowsCancelFunc()
+	this.countTableRowsCancelFunc = nil
 }
 
 // ElapsedTime returns time since very beginning of the process
@@ -708,7 +779,7 @@ func (this *MigrationContext) ReadMaxLoad(maxLoadList string) error {
 	return nil
 }
 
-// ReadMaxLoad parses the `--max-load` flag, which is in multiple key-value format,
+// ReadCriticalLoad parses the `--max-load` flag, which is in multiple key-value format,
 // such as: 'Threads_running=100,Threads_connected=500'
 // It only applies changes in case there's no parsing error.
 func (this *MigrationContext) ReadCriticalLoad(criticalLoadList string) error {
@@ -812,33 +883,33 @@ func (this *MigrationContext) ReadConfigFile() error {
 		return err
 	}
 
-	if cfg.Section("client").Haskey("user") {
+	if cfg.Section("client").HasKey("user") {
 		this.config.Client.User = cfg.Section("client").Key("user").String()
 	}
 
-	if cfg.Section("client").Haskey("password") {
+	if cfg.Section("client").HasKey("password") {
 		this.config.Client.Password = cfg.Section("client").Key("password").String()
 	}
 
-	if cfg.Section("osc").Haskey("chunk_size") {
+	if cfg.Section("osc").HasKey("chunk_size") {
 		this.config.Osc.Chunk_Size, err = cfg.Section("osc").Key("chunk_size").Int64()
 		if err != nil {
-			return fmt.Errorf("Unable to read osc chunk size: %s", err.Error())
+			return fmt.Errorf("Unable to read osc chunk size: %w", err)
 		}
 	}
 
-	if cfg.Section("osc").Haskey("max_load") {
+	if cfg.Section("osc").HasKey("max_load") {
 		this.config.Osc.Max_Load = cfg.Section("osc").Key("max_load").String()
 	}
 
-	if cfg.Section("osc").Haskey("replication_lag_query") {
+	if cfg.Section("osc").HasKey("replication_lag_query") {
 		this.config.Osc.Replication_Lag_Query = cfg.Section("osc").Key("replication_lag_query").String()
 	}
 
-	if cfg.Section("osc").Haskey("max_lag_millis") {
+	if cfg.Section("osc").HasKey("max_lag_millis") {
 		this.config.Osc.Max_Lag_Millis, err = cfg.Section("osc").Key("max_lag_millis").Int64()
 		if err != nil {
-			return fmt.Errorf("Unable to read max lag millis: %s", err.Error())
+			return fmt.Errorf("Unable to read max lag millis: %w", err)
 		}
 	}
 

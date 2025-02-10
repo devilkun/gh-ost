@@ -1,6 +1,4 @@
 #!/bin/bash
-#
-#
 
 RELEASE_VERSION=
 buildpath=
@@ -23,24 +21,25 @@ function build {
     exit 1
   fi
 
-  echo "Building ${osname} binary"
+  echo "Building ${osname}-${GOARCH} binary"
   export GOOS
   export GOARCH
   go build -ldflags "$ldflags" -o $buildpath/$target go/cmd/gh-ost/main.go
 
   if [ $? -ne 0 ]; then
-      echo "Build failed for ${osname}"
+      echo "Build failed for ${osname} ${GOARCH}."
       exit 1
   fi
 
-  (cd $buildpath && tar cfz ./gh-ost-binary-${osshort}-${timestamp}.tar.gz $target)
+  (cd $buildpath && tar cfz ./gh-ost-binary-${osshort}-${GOARCH}-${timestamp}.tar.gz $target)
 
-  if [ "$GOOS" == "linux" ] ; then
+  # build RPM and deb for Linux, x86-64 only
+  if [ "$GOOS" == "linux" ] && [ "$GOARCH" == "amd64" ] ; then
     echo "Creating Distro full packages"
     builddir=$(setuptree)
     cp $buildpath/$target $builddir/gh-ost/usr/bin
     cd $buildpath
-    fpm -v "${RELEASE_VERSION}" --epoch 1 -f -s dir -n gh-ost -m 'GitHub' --description "GitHub's Online Schema Migrations for MySQL " --url "https://github.com/github/gh-ost" --vendor "GitHub" --license "Apache 2.0" -C $builddir/gh-ost --prefix=/ -t rpm --rpm-rpmbuild-define "_build_id_links none" .
+    fpm -v "${RELEASE_VERSION}" --epoch 1 -f -s dir -n gh-ost -m 'GitHub' --description "GitHub's Online Schema Migrations for MySQL " --url "https://github.com/github/gh-ost" --vendor "GitHub" --license "Apache 2.0" -C $builddir/gh-ost --prefix=/ -t rpm --rpm-rpmbuild-define "_build_id_links none" --rpm-os linux .
     fpm -v "${RELEASE_VERSION}" --epoch 1 -f -s dir -n gh-ost -m 'GitHub' --description "GitHub's Online Schema Migrations for MySQL " --url "https://github.com/github/gh-ost" --vendor "GitHub" --license "Apache 2.0" -C $builddir/gh-ost --prefix=/ -t deb --deb-no-default-config-files .
     cd -
   fi
@@ -51,25 +50,34 @@ main() {
     RELEASE_VERSION=$(git describe --abbrev=0 --tags | tr -d 'v')
   fi
   if [ -z "${RELEASE_VERSION}" ] ; then
-    RELEASE_VERSION=$(cat RELEASE_VERSION)
+    echo "RELEASE_VERSION must be set"
+    exit 1
   fi
 
+  if [ -z "${GIT_COMMIT}" ]; then
+    GIT_COMMIT=$(git rev-parse HEAD)
+  fi
 
   buildpath=/tmp/gh-ost-release
   target=gh-ost
   timestamp=$(date "+%Y%m%d%H%M%S")
-  ldflags="-X main.AppVersion=${RELEASE_VERSION}"
+  ldflags="-X main.AppVersion=${RELEASE_VERSION} -X main.GitCommit=${GIT_COMMIT}"
 
   mkdir -p ${buildpath}
   rm -rf ${buildpath:?}/*
   build GNU/Linux linux linux amd64
+  build GNU/Linux linux linux arm64
   build macOS osx darwin amd64
+  build macOS osx darwin arm64
 
+  bin_files=$(find $buildpath/gh-ost* -type f -maxdepth 1)
   echo "Binaries found in:"
-  find $buildpath/gh-ost* -type f -maxdepth 1
+  echo "$bin_files"
 
   echo "Checksums:"
-  (cd $buildpath && shasum -a256 gh-ost* 2>/dev/null)
+  (shasum -a256 $bin_files 2>/dev/null)
+
+  echo "Build Success!"
 }
 
 main "$@"

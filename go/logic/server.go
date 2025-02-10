@@ -1,5 +1,5 @@
 /*
-   Copyright 2021 GitHub Inc.
+   Copyright 2022 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -7,15 +7,28 @@ package logic
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/github/gh-ost/go/base"
+)
+
+var (
+	ErrCPUProfilingBadOption  = errors.New("unrecognized cpu profiling option")
+	ErrCPUProfilingInProgress = errors.New("cpu profiling already in progress")
+	defaultCPUProfileDuration = time.Second * 30
 )
 
 type printStatusFunc func(PrintStatusRule, io.Writer)
@@ -27,6 +40,7 @@ type Server struct {
 	tcpListener      net.Listener
 	hooksExecutor    *HooksExecutor
 	printStatus      printStatusFunc
+	isCPUProfiling   int64
 }
 
 func NewServer(migrationContext *base.MigrationContext, hooksExecutor *HooksExecutor, printStatus printStatusFunc) *Server {
@@ -35,6 +49,54 @@ func NewServer(migrationContext *base.MigrationContext, hooksExecutor *HooksExec
 		hooksExecutor:    hooksExecutor,
 		printStatus:      printStatus,
 	}
+}
+
+func (this *Server) runCPUProfile(args string) (io.Reader, error) {
+	duration := defaultCPUProfileDuration
+
+	var err error
+	var blockProfile, useGzip bool
+	if args != "" {
+		s := strings.Split(args, ",")
+		// a duration string must be the 1st field, if any
+		if duration, err = time.ParseDuration(s[0]); err != nil {
+			return nil, err
+		}
+		for _, arg := range s[1:] {
+			switch arg {
+			case "block", "blocked", "blocking":
+				blockProfile = true
+			case "gzip":
+				useGzip = true
+			default:
+				return nil, ErrCPUProfilingBadOption
+			}
+		}
+	}
+
+	if atomic.LoadInt64(&this.isCPUProfiling) > 0 {
+		return nil, ErrCPUProfilingInProgress
+	}
+	atomic.StoreInt64(&this.isCPUProfiling, 1)
+	defer atomic.StoreInt64(&this.isCPUProfiling, 0)
+
+	var buf bytes.Buffer
+	var writer io.Writer = &buf
+	if blockProfile {
+		runtime.SetBlockProfileRate(1)
+		defer runtime.SetBlockProfileRate(0)
+	}
+	if useGzip {
+		writer = gzip.NewWriter(writer)
+	}
+	if err = pprof.StartCPUProfile(writer); err != nil {
+		return nil, err
+	}
+
+	time.Sleep(duration)
+	pprof.StopCPUProfile()
+	this.migrationContext.Log.Infof("Captured %d byte runtime/pprof CPU profile (gzip=%v)", buf.Len(), useGzip)
+	return &buf, nil
 }
 
 func (this *Server) BindSocketFile() (err error) {
@@ -122,8 +184,6 @@ func (this *Server) onServerCommand(command string, writer *bufio.Writer) (err e
 
 // applyServerCommand parses and executes commands by user
 func (this *Server) applyServerCommand(command string, writer *bufio.Writer) (printStatusRule PrintStatusRule, err error) {
-	printStatusRule = NoPrintStatusRule
-
 	tokens := strings.SplitN(command, "=", 2)
 	command = strings.TrimSpace(tokens[0])
 	arg := ""
@@ -134,7 +194,7 @@ func (this *Server) applyServerCommand(command string, writer *bufio.Writer) (pr
 		}
 	}
 	argIsQuestion := (arg == "?")
-	throttleHint := "# Note: you may only throttle for as long as your binary logs are not purged\n"
+	throttleHint := "# Note: you may only throttle for as long as your binary logs are not purged"
 
 	if err := this.hooksExecutor.onInteractiveCommand(command); err != nil {
 		return NoPrintStatusRule, err
@@ -146,6 +206,7 @@ func (this *Server) applyServerCommand(command string, writer *bufio.Writer) (pr
 			fmt.Fprint(writer, `available commands:
 status                               # Print a detailed status message
 sup                                  # Print a short status message
+cpu-profile=<options>                # Print a base64-encoded runtime/pprof CPU profile using a duration, default: 30s. Comma-separated options 'gzip' and/or 'block' (blocked profile) may follow the profile duration
 coordinates                          # Print the currently inspected coordinates
 applier                              # Print the hostname of the applier
 inspector                            # Print the hostname of the inspector
@@ -171,6 +232,12 @@ help                                 # This message
 		return ForcePrintStatusOnlyRule, nil
 	case "info", "status":
 		return ForcePrintStatusAndHintRule, nil
+	case "cpu-profile":
+		cpuProfile, err := this.runCPUProfile(arg)
+		if err == nil {
+			fmt.Fprint(base64.NewEncoder(base64.StdEncoding, writer), cpuProfile)
+		}
+		return NoPrintStatusRule, err
 	case "coordinates":
 		{
 			if argIsQuestion || arg == "" {
@@ -282,7 +349,7 @@ help                                 # This message
 				return NoPrintStatusRule, nil
 			}
 			this.migrationContext.SetThrottleQuery(arg)
-			fmt.Fprintf(writer, throttleHint)
+			fmt.Fprintln(writer, throttleHint)
 			return ForcePrintStatusAndHintRule, nil
 		}
 	case "throttle-http":
@@ -292,7 +359,7 @@ help                                 # This message
 				return NoPrintStatusRule, nil
 			}
 			this.migrationContext.SetThrottleHTTP(arg)
-			fmt.Fprintf(writer, throttleHint)
+			fmt.Fprintln(writer, throttleHint)
 			return ForcePrintStatusAndHintRule, nil
 		}
 	case "throttle-control-replicas":
@@ -315,7 +382,7 @@ help                                 # This message
 				return NoPrintStatusRule, err
 			}
 			atomic.StoreInt64(&this.migrationContext.ThrottleCommandedByUser, 1)
-			fmt.Fprintf(writer, throttleHint)
+			fmt.Fprintln(writer, throttleHint)
 			return ForcePrintStatusAndHintRule, nil
 		}
 	case "no-throttle", "unthrottle", "resume", "continue":

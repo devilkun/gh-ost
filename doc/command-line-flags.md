@@ -6,6 +6,10 @@ A more in-depth discussion of various `gh-ost` command line flags: implementatio
 
 Add this flag when executing on Aliyun RDS.
 
+### allow-zero-in-date
+
+Allows the user to make schema changes that include a zero date or zero in date (e.g. adding a `datetime default '0000-00-00 00:00:00'` column), even if global `sql_mode` on MySQL has `NO_ZERO_IN_DATE,NO_ZERO_DATE`.
+
 ###  azure
 
 Add this flag when executing on Azure Database for MySQL.
@@ -40,6 +44,25 @@ If you think `gh-ost` is mistaken and that there's actually no _rename_ involved
 If you happen to _know_ your servers use RBR (Row Based Replication, i.e. `binlog_format=ROW`), you may specify `--assume-rbr`. This skips a verification step where `gh-ost` would issue a `STOP SLAVE; START SLAVE`.
 Skipping this step means `gh-ost` would not need the `SUPER` privilege in order to operate.
 You may want to use this on Amazon RDS.
+
+### attempt-instant-ddl
+
+MySQL 8.0 supports "instant DDL" for some operations. If an alter statement can be completed with instant DDL, only a metadata change is required internally. Instant operations include:
+
+- Adding a column
+- Dropping a column
+- Dropping an index
+- Extending a varchar column
+- Adding a virtual generated column
+
+It is not reliable to parse the `ALTER` statement to determine if it is instant or not. This is because the table might be in an older row format, or have some other incompatibility that is difficult to identify.
+
+`--attempt-instant-ddl` is disabled by default, but the risks of enabling it are relatively minor: `gh-ost` may need to acquire a metadata lock at the start of the operation. This is not a problem for most scenarios, but it could be a problem for users that start the DDL during a period with long running transactions.
+
+`gh-ost` will automatically fallback to the normal DDL process if the attempt to use instant DDL is unsuccessful.
+
+### binlogsyncer-max-reconnect-attempts
+`--binlogsyncer-max-reconnect-attempts=0`, the maximum number of attempts to re-establish a broken inspector connection for sync binlog. `0` or `negative number` means infinite retry, default `0`
 
 ### conf
 
@@ -167,6 +190,8 @@ When using [Connect to replica, migrate on master](cheatsheet.md#a-connect-to-re
 
 When [`--throttle-control-replicas`](#throttle-control-replicas) is provided, throttling also considers lag on specified hosts. Lag measurements on listed hosts is done by querying `gh-ost`'s _changelog_ table, where `gh-ost` injects a heartbeat.
 
+When using on master or when `--allow-on-master` is provided, `max-lag-millis` is also considered a threshold for starting the cutover stage of the migration. If the row copy is complete and the heartbeat lag is less than `max-lag-millis` cutover phase of the migration will start. 
+
 See also: [Sub-second replication lag throttling](subsecond-lag.md)
 
 ### max-load
@@ -226,6 +251,21 @@ Allows `gh-ost` to connect to the MySQL servers using encrypted connections, but
 
 `--ssl-key=/path/to/ssl-key.key`: SSL private key file (in PEM format).
 
+### storage-engine
+Default is `innodb`, and `rocksdb` support is currently experimental. InnoDB and RocksDB are both transactional engines, supporting both shared and exclusive row locks.
+
+But RocksDB currently lacks a few features support compared to InnoDB:
+- Gap Locks
+- Foreign Key
+- Generated Columns
+- Spatial
+- Geometry
+
+When `--storage-engine=rocksdb`, `gh-ost` will make some changes necessary (e.g. sets isolation level to `READ_COMMITTED`) to support RocksDB.
+
+### charset
+The default charset for the database connection is utf8mb4, utf8, latin1. The ability to specify character set and collation is supported, eg: utf8mb4_general_ci,utf8_general_ci,latin1. 
+
 ### test-on-replica
 
 Issue the migration on a replica; do not modify data on master. Useful for validating, testing and benchmarking. See [`testing-on-replica`](testing-on-replica.md)
@@ -241,6 +281,14 @@ Provide a command delimited list of replicas; `gh-ost` will throttle when any of
 ### throttle-http
 
 Provide an HTTP endpoint; `gh-ost` will issue `HEAD` requests on given URL and throttle whenever response status code is not `200`. The URL can be queried and updated dynamically via [interactive commands](interactive-commands.md). Empty URL disables the HTTP check.
+
+### throttle-http-interval-millis
+
+Defaults to 100. Configures the HTTP throttle check interval in milliseconds.
+
+### throttle-http-timeout-millis
+
+Defaults to 1000 (1 second). Configures the HTTP throttler check timeout in milliseconds.
 
 ### timestamp-old-table
 
